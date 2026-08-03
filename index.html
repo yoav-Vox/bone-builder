@@ -234,6 +234,11 @@
     <p class="eyebrow">Logged weights</p>
     <div id="wtList"><p style="color:var(--mut); font-size:14px">Weights you enter during sessions appear here.</p></div>
   </div>
+  <div class="card">
+    <p class="eyebrow">Rest-timer alarm</p>
+    <p style="font-size:13px; color:var(--mut); margin:6px 0 0">Play it now to set your phone's volume before you're mid-set. On an iPhone, the side silent switch mutes it — flick that off.</p>
+    <button class="btn sm" id="testSound">🔊 Play the alarm</button>
+  </div>
   <button class="btn ghost sm" id="resetBtn">Reset all data</button>
 </div></div>
 
@@ -793,6 +798,7 @@ function renderProg(){
       `<div class="hist"><span>${EX[k]?EX[k].name:k}</span><span class="num" style="color:var(--amber); font-weight:700">${weights[k].w} kg</span></div>`).join("");
   }
 }
+document.getElementById("testSound").addEventListener("click", ()=>beep());
 document.getElementById("resetBtn").addEventListener("click", ()=>{
   if(confirm("Delete all history, weights and schedule changes?")){
     localStorage.removeItem("bone.sched"); localStorage.removeItem("bone.weights"); localStorage.removeItem("bone.hist");
@@ -940,27 +946,64 @@ function restEnd(silent){
   clearInterval(restIv); restIv=null;
   document.getElementById("rest").classList.remove("on");
 }
+/* Gym alarm: loud, cutting, ~3 s long. Built to be heard over music and machines. */
+let masterOut = null;
+function ensureAudio(){
+  if(!audioCtx){
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    /* master -> lowpass (tames phone-speaker harshness) -> compressor (acts as a limiter,
+       so we can push the level hard without it breaking up) -> out */
+    masterOut = audioCtx.createGain();
+    masterOut.gain.value = 1;
+    const lp = audioCtx.createBiquadFilter();
+    lp.type = "lowpass"; lp.frequency.value = 7000;
+    const comp = audioCtx.createDynamicsCompressor();
+    comp.threshold.value = -14; comp.knee.value = 8; comp.ratio.value = 14;
+    comp.attack.value = 0.002; comp.release.value = 0.15;
+    /* makeup gain: the compressor holds the peaks down, so this pushes the whole
+       alarm up near full scale without distorting. 1.35 leaves a safety margin. */
+    const makeup = audioCtx.createGain();
+    makeup.gain.value = 1.35;
+    masterOut.connect(lp); lp.connect(comp); comp.connect(makeup); makeup.connect(audioCtx.destination);
+  }
+  /* phones suspend the context in the background — always wake it before playing */
+  if(audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+/* one pulse = fundamental + two harmonics, which cuts through noise far better than a pure sine */
+function pulse(t, dur, freq, vol){
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.010);
+  g.gain.setValueAtTime(vol, t + dur - 0.05);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  g.connect(masterOut);
+  [["square", freq, 0.60], ["sine", freq*2, 0.30], ["sine", freq*3, 0.14]].forEach(([type, f, mul])=>{
+    const o = audioCtx.createOscillator(); o.type = type; o.frequency.value = f;
+    const og = audioCtx.createGain(); og.gain.value = mul;
+    o.connect(og); og.connect(g);
+    o.start(t); o.stop(t + dur + 0.02);
+  });
+}
 function beep(){
   try{
-    audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
-    const t = audioCtx.currentTime;
-    for(let i=0;i<2;i++){
-      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-      o.frequency.value = 880; o.type="sine";
-      g.gain.setValueAtTime(0.0001, t+i*0.25);
-      g.gain.exponentialRampToValueAtTime(0.3, t+i*0.25+0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, t+i*0.25+0.2);
-      o.connect(g).connect(audioCtx.destination);
-      o.start(t+i*0.25); o.stop(t+i*0.25+0.22);
-    }
-    if(navigator.vibrate) navigator.vibrate([120,80,120]);
+    ensureAudio();
+    const t0 = audioCtx.currentTime + 0.03;
+    /* two-tone alarm around 1.2–1.7 kHz — where ears are most sensitive and
+       phone speakers are loudest. 8 pulses ≈ 3 s. */
+    const LO = 1245, HI = 1661, step = 0.36, dur = 0.24;
+    for(let i=0;i<8;i++) pulse(t0 + i*step, dur, i%2 ? HI : LO, 0.95);
+    /* final long tone so the last thing you hear is unmistakable */
+    pulse(t0 + 8*step, 0.75, HI, 0.95);
+    if(navigator.vibrate) navigator.vibrate([400,150,400,150,400,150,900]);
   }catch(e){}
 }
-/* unlock audio on first touch (iOS) */
-document.addEventListener("touchstart", function once(){
-  try{ audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)(); }catch(e){}
-  document.removeEventListener("touchstart", once);
-}, {once:true});
+/* unlock audio on the first interaction (iOS/Android require a user gesture) */
+["touchstart","mousedown","keydown"].forEach(evt=>
+  document.addEventListener(evt, function once(){
+    try{ ensureAudio(); }catch(e){}
+    ["touchstart","mousedown","keydown"].forEach(e2=>document.removeEventListener(e2, once));
+  }, {once:true, passive:true}));
 
 renderToday();
 </script>
