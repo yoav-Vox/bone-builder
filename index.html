@@ -84,6 +84,10 @@
   .bml i{width:10px; height:10px; border-radius:3px; flex:0 0 10px}
   .bml .dp{background:var(--amber)} .bml .ds{background:#5b708a}
   .note.hard{border-color:var(--green)}
+  .togrow{display:flex; gap:10px; align-items:flex-start; margin-top:14px; cursor:pointer}
+  .togrow input{flex:0 0 auto; width:20px; height:20px; margin:1px 0 0; accent-color:var(--amber)}
+  .togrow span{font-size:12.5px; color:var(--mut); line-height:1.45}
+  .togrow b{display:block; color:var(--bone); font-size:14px; margin-bottom:2px}
   .altwrap{display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px}
   @media (max-width:420px){ .altwrap{grid-template-columns:1fr} }
   .alt{background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:10px 12px}
@@ -238,6 +242,11 @@
     <p class="eyebrow">Rest-timer alarm</p>
     <p style="font-size:13px; color:var(--mut); margin:6px 0 0">Play it now to set your phone's volume before you're mid-set. On an iPhone, the side silent switch mutes it — flick that off.</p>
     <button class="btn sm" id="testSound">🔊 Play the alarm</button>
+    <label class="togrow" for="bgToggle">
+      <input type="checkbox" id="bgToggle" checked>
+      <span><b>Ring even when the screen is locked</b>
+      Plays the countdown as a silent background track, so the alarm still sounds with the phone locked or in your pocket. It may pause music you have playing during the rest period — turn this off if that bothers you, and the alarm will instead sound the moment you wake the screen.</span>
+    </label>
   </div>
   <button class="btn ghost sm" id="resetBtn">Reset all data</button>
 </div></div>
@@ -257,6 +266,7 @@
   <div class="wrap" id="pbody"></div>
 </div>
 
+<audio id="bgAlarm" playsinline preload="auto"></audio>
 <div id="rest">
   <p class="lbl">Rest — next set when it hits zero</p>
   <div class="t num" id="restT">1:30</div>
@@ -799,6 +809,15 @@ function renderProg(){
   }
 }
 document.getElementById("testSound").addEventListener("click", ()=>beep());
+(function(){
+  const t = document.getElementById("bgToggle");
+  t.checked = bgEnabled();
+  t.addEventListener("change", ()=>{
+    store.set("bgAlarm", t.checked);
+    if(!t.checked){ stopBgAlarm(); if(restEndAt) scheduleAlarm(restLeftSec()); }
+    else if(restEndAt && startBgAlarm(restLeftSec())) cancelScheduledAlarm();
+  });
+})();
 document.getElementById("resetBtn").addEventListener("click", ()=>{
   if(confirm("Delete all history, weights and schedule changes?")){
     localStorage.removeItem("bone.sched"); localStorage.removeItem("bone.weights"); localStorage.removeItem("bone.hist");
@@ -927,6 +946,73 @@ function logW(exId, v){
   if(!isNaN(w) && w>0){ weights[exId] = {w, date:new Date().toISOString()}; store.set("weights", weights); }
 }
 
+/* ---------------- Background alarm ----------------
+   A locked screen suspends the AudioContext, which stops its clock — so an
+   alarm scheduled on that clock never reaches its start time and only fires
+   once you unlock. The OS does keep playing an ordinary media stream while
+   locked, so we render the whole rest period into a single WAV: near-silence
+   for the countdown, then the alarm. The media pipeline, not JavaScript, is
+   then doing the timing, so it sounds on time with the screen off. */
+let bgAudio = null, bgUrl = null;
+function bgEnabled(){ return store.get("bgAlarm", true) !== false; }
+/* additive sines only (no square wave) so nothing aliases at 16 kHz */
+function renderAlarmWav(restSec){
+  const SR = 16000, TAIL = 3.95;
+  const total = Math.ceil((restSec + TAIL) * SR);
+  const pcm = new Int16Array(total);
+  for(let i=0;i<total;i++) pcm[i] = (i & 1) ? 1 : -1;   /* dither, not digital black */
+  const LO = 1245, HI = 1661, step = 0.36, dur = 0.24;
+  const notes = [];
+  for(let i=0;i<8;i++) notes.push([i*step, dur, i%2 ? HI : LO]);
+  notes.push([8*step, 0.75, HI]);
+  for(const note of notes){
+    const off = note[0], d = note[1], f = note[2];
+    const start = Math.floor((restSec + off) * SR), len = Math.floor(d * SR);
+    for(let i=0;i<len;i++){
+      const idx = start + i; if(idx >= total) break;
+      const t = i / SR;
+      const env = Math.max(0, Math.min(1, t/0.010, (d - t)/0.05));
+      let v = Math.sin(2*Math.PI*f*t) + 0.5*Math.sin(4*Math.PI*f*t) + 0.22*Math.sin(6*Math.PI*f*t);
+      /* headroom: resampling 16 kHz -> the device rate overshoots ~15%, so cap
+         below full scale or the alarm crackles on playback */
+      v = Math.tanh(v * 1.45) * 0.83 * env;
+      pcm[idx] = Math.max(-32767, Math.min(32767, Math.round(v * 32767)));
+    }
+  }
+  const buf = new ArrayBuffer(44 + pcm.length*2), dv = new DataView(buf);
+  const wr = (o,s)=>{ for(let i=0;i<s.length;i++) dv.setUint8(o+i, s.charCodeAt(i)); };
+  wr(0,"RIFF"); dv.setUint32(4, 36 + pcm.length*2, true); wr(8,"WAVE"); wr(12,"fmt ");
+  dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+  dv.setUint32(24,SR,true); dv.setUint32(28,SR*2,true); dv.setUint16(32,2,true); dv.setUint16(34,16,true);
+  wr(36,"data"); dv.setUint32(40, pcm.length*2, true);
+  new Int16Array(buf, 44).set(pcm);
+  return URL.createObjectURL(new Blob([buf], {type:"audio/wav"}));
+}
+function stopBgAlarm(){
+  try{ if(bgAudio){ bgAudio.pause(); bgAudio.removeAttribute("src"); bgAudio.load(); } }catch(e){}
+  if(bgUrl){ try{ URL.revokeObjectURL(bgUrl); }catch(e){} bgUrl = null; }
+}
+function startBgAlarm(sec){
+  if(!bgEnabled() || sec <= 0) return false;
+  try{
+    stopBgAlarm();
+    bgAudio = bgAudio || document.getElementById("bgAlarm");
+    if(!bgAudio) return false;
+    bgUrl = renderAlarmWav(sec);
+    bgAudio.src = bgUrl;
+    bgAudio.loop = false;
+    const p = bgAudio.play();
+    /* if the browser refuses to start it, fall back to the Web-Audio alarm */
+    if(p && p.catch) p.catch(function(){ stopBgAlarm(); scheduleAlarm(restLeftSec()); });
+    if(navigator.mediaSession && window.MediaMetadata){
+      navigator.mediaSession.metadata = new MediaMetadata({title:"Rest timer", artist:"Bone Builder"});
+    }
+    return true;
+  }catch(e){ stopBgAlarm(); return false; }
+}
+/* true while the background track is running and will sound the alarm itself */
+function bgArmed(){ return !!(bgUrl && bgAudio && !bgAudio.paused && !bgAudio.ended); }
+
 /* ---------------- Rest timer ---------------- */
 /* Wall-clock based on purpose: phones throttle (or fully pause) JS timers when
    the screen goes off, so counting down by one per tick runs slow and drifts.
@@ -940,7 +1026,8 @@ function startRest(sec){
   drawRest();
   clearInterval(restIv);
   restIv = setInterval(tickRest, 250);
-  scheduleAlarm(sec);
+  /* background track is the reliable path; Web Audio is the fallback */
+  if(startBgAlarm(sec)) cancelScheduledAlarm(); else scheduleAlarm(sec);
 }
 function tickRest(){
   if(restLeftSec() <= 0){ fireAlarm(); restEnd(); } else drawRest();
@@ -953,13 +1040,14 @@ function drawRest(){
 function restAdd(n){
   if(!restEndAt) return;
   restEndAt += n*1000;
-  scheduleAlarm(restLeftSec());
+  if(startBgAlarm(restLeftSec())) cancelScheduledAlarm(); else scheduleAlarm(restLeftSec());
   drawRest();
 }
 function restEnd(silent){
   clearInterval(restIv); restIv=null;
   restEndAt = 0;
   cancelScheduledAlarm();
+  stopBgAlarm();
   document.getElementById("rest").classList.remove("on");
 }
 /* Keep the screen from sleeping during a session, so the timer stays visible
@@ -980,7 +1068,7 @@ function resumeRest(){
   if(document.getElementById("player").classList.contains("on")) keepScreenAwake(true);
   if(!restEndAt) return;
   if(restLeftSec() <= 0){ fireAlarm(); restEnd(); }
-  else { drawRest(); scheduleAlarm(restLeftSec()); }
+  else { drawRest(); if(!bgArmed()) scheduleAlarm(restLeftSec()); }
 }
 /* phones differ in which of these they fire when the screen comes back on,
    so listen for all three — resumeRest() is safe to run repeatedly */
@@ -1059,6 +1147,8 @@ function buzz(){ if(navigator.vibrate) navigator.vibrate([400,150,400,150,400,15
 /* Countdown hit zero. If the pre-scheduled alarm is already sounding, don't
    stack a second one on top of it. */
 function fireAlarm(){
+  /* the background track is already sounding the alarm — just add the buzz */
+  if(bgArmed()){ schedOscs = []; schedAt = 0; buzz(); return; }
   const already = schedAt && audioCtx && audioCtx.state === "running"
                   && audioCtx.currentTime >= schedAt - 0.2;
   if(already){ schedOscs = []; schedAt = 0; buzz(); }
