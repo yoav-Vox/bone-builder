@@ -813,11 +813,13 @@ function startSession(sid){
   cur = {sid, idx:0, done:{}, swap:{}};
   document.getElementById("player").classList.add("on");
   document.body.style.overflow = "hidden";
+  keepScreenAwake(true);
   renderEx();
 }
 function closePlayer(){
   document.getElementById("player").classList.remove("on");
   document.body.style.overflow = "";
+  keepScreenAwake(false);
   restEnd(true);
   renderToday();
 }
@@ -926,26 +928,65 @@ function logW(exId, v){
 }
 
 /* ---------------- Rest timer ---------------- */
-let restLeft = 0, restIv = null, audioCtx = null;
+/* Wall-clock based on purpose: phones throttle (or fully pause) JS timers when
+   the screen goes off, so counting down by one per tick runs slow and drifts.
+   We store the moment rest ends and derive the display from the real clock, so
+   the countdown is always correct no matter how late a tick arrives. */
+let restEndAt = 0, restIv = null, audioCtx = null, wakeLock = null;
+function restLeftSec(){ return restEndAt ? Math.max(0, Math.ceil((restEndAt - Date.now())/1000)) : 0; }
 function startRest(sec){
-  restLeft = sec;
+  restEndAt = Date.now() + sec*1000;
   document.getElementById("rest").classList.add("on");
   drawRest();
   clearInterval(restIv);
-  restIv = setInterval(()=>{
-    restLeft--;
-    if(restLeft<=0){ beep(); restEnd(); } else drawRest();
-  },1000);
+  restIv = setInterval(tickRest, 250);
+  scheduleAlarm(sec);
+}
+function tickRest(){
+  if(restLeftSec() <= 0){ fireAlarm(); restEnd(); } else drawRest();
 }
 function drawRest(){
-  const m = Math.floor(restLeft/60), s = restLeft%60;
+  const left = restLeftSec();
+  const m = Math.floor(left/60), s = left%60;
   document.getElementById("restT").textContent = m+":"+String(s).padStart(2,"0");
 }
-function restAdd(n){ restLeft += n; drawRest(); }
+function restAdd(n){
+  if(!restEndAt) return;
+  restEndAt += n*1000;
+  scheduleAlarm(restLeftSec());
+  drawRest();
+}
 function restEnd(silent){
   clearInterval(restIv); restIv=null;
+  restEndAt = 0;
+  cancelScheduledAlarm();
   document.getElementById("rest").classList.remove("on");
 }
+/* Keep the screen from sleeping during a session, so the timer stays visible
+   and audio never gets suspended. Released when the session closes. */
+async function keepScreenAwake(on){
+  try{
+    if(on){
+      if(!wakeLock && "wakeLock" in navigator){
+        wakeLock = await navigator.wakeLock.request("screen");
+        wakeLock.addEventListener("release", ()=>{ wakeLock = null; });
+      }
+    } else if(wakeLock){ await wakeLock.release(); wakeLock = null; }
+  }catch(e){ wakeLock = null; }
+}
+/* Coming back from a locked screen: re-sync the display, re-arm the alarm, and
+   if rest already ran out while we were away, sound it now. */
+function resumeRest(){
+  if(document.getElementById("player").classList.contains("on")) keepScreenAwake(true);
+  if(!restEndAt) return;
+  if(restLeftSec() <= 0){ fireAlarm(); restEnd(); }
+  else { drawRest(); scheduleAlarm(restLeftSec()); }
+}
+/* phones differ in which of these they fire when the screen comes back on,
+   so listen for all three — resumeRest() is safe to run repeatedly */
+document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState === "visible") resumeRest(); });
+window.addEventListener("focus", resumeRest);
+window.addEventListener("pageshow", resumeRest);
 /* Gym alarm: loud, cutting, ~3 s long. Built to be heard over music and machines. */
 let masterOut = null;
 function ensureAudio(){
@@ -972,6 +1013,7 @@ function ensureAudio(){
 }
 /* one pulse = fundamental + two harmonics, which cuts through noise far better than a pure sine */
 function pulse(t, dur, freq, vol){
+  const oscs = [];
   const g = audioCtx.createGain();
   g.gain.setValueAtTime(0.0001, t);
   g.gain.exponentialRampToValueAtTime(vol, t + 0.010);
@@ -983,19 +1025,51 @@ function pulse(t, dur, freq, vol){
     const og = audioCtx.createGain(); og.gain.value = mul;
     o.connect(og); og.connect(g);
     o.start(t); o.stop(t + dur + 0.02);
+    oscs.push(o);
   });
+  return oscs;
+}
+/* the full alarm, built to start at audio-clock time t; returns its oscillators */
+function alarmVoices(t){
+  /* two-tone alarm around 1.2–1.7 kHz — where ears are most sensitive and
+     phone speakers are loudest. 8 pulses + a long final tone ≈ 3.6 s. */
+  const LO = 1245, HI = 1661, step = 0.36, dur = 0.24;
+  let oscs = [];
+  for(let i=0;i<8;i++) oscs = oscs.concat(pulse(t + i*step, dur, i%2 ? HI : LO, 0.95));
+  return oscs.concat(pulse(t + 8*step, 0.75, HI, 0.95));
+}
+let schedOscs = [], schedAt = 0;
+function cancelScheduledAlarm(){
+  schedOscs.forEach(o=>{ try{ o.stop(0); }catch(e){} try{ o.disconnect(); }catch(e){} });
+  schedOscs = []; schedAt = 0;
+}
+/* Arm the alarm on the AUDIO clock. Audio keeps accurate timing even while JS
+   timers are throttled, so the alarm still sounds on time with the screen off. */
+function scheduleAlarm(sec){
+  try{
+    cancelScheduledAlarm();      /* cancel before resuming, so stale nodes can't blast */
+    ensureAudio();
+    if(audioCtx.state !== "running") return false;
+    schedAt = audioCtx.currentTime + sec;
+    schedOscs = alarmVoices(schedAt);
+    return true;
+  }catch(e){ cancelScheduledAlarm(); return false; }
+}
+function buzz(){ if(navigator.vibrate) navigator.vibrate([400,150,400,150,400,150,900]); }
+/* Countdown hit zero. If the pre-scheduled alarm is already sounding, don't
+   stack a second one on top of it. */
+function fireAlarm(){
+  const already = schedAt && audioCtx && audioCtx.state === "running"
+                  && audioCtx.currentTime >= schedAt - 0.2;
+  if(already){ schedOscs = []; schedAt = 0; buzz(); }
+  else beep();
 }
 function beep(){
   try{
+    cancelScheduledAlarm();
     ensureAudio();
-    const t0 = audioCtx.currentTime + 0.03;
-    /* two-tone alarm around 1.2–1.7 kHz — where ears are most sensitive and
-       phone speakers are loudest. 8 pulses ≈ 3 s. */
-    const LO = 1245, HI = 1661, step = 0.36, dur = 0.24;
-    for(let i=0;i<8;i++) pulse(t0 + i*step, dur, i%2 ? HI : LO, 0.95);
-    /* final long tone so the last thing you hear is unmistakable */
-    pulse(t0 + 8*step, 0.75, HI, 0.95);
-    if(navigator.vibrate) navigator.vibrate([400,150,400,150,400,150,900]);
+    alarmVoices(audioCtx.currentTime + 0.03);
+    buzz();
   }catch(e){}
 }
 /* unlock audio on the first interaction (iOS/Android require a user gesture) */
